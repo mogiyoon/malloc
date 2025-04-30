@@ -14,6 +14,7 @@
 #include <assert.h>
 #include <unistd.h>
 #include <string.h>
+#include <stdint.h>
 
 #include "mm.h"
 #include "memlib.h"
@@ -38,7 +39,7 @@ team_t team = {
 /* Basic constants and macros */
 #define WSIZE 4
 #define DSIZE 8
-#define CHUNKSIZE (1<<12)
+#define CHUNKSIZE (1<<12) // 4096
 
 /* single word (4) or double word (8) alignment */
 #define ALIGNMENT DSIZE
@@ -65,20 +66,34 @@ team_t team = {
 #define HDRP(bp) ((char*)(bp) - WSIZE)
 #define FTRP(bp) ((char*)(bp) + GET_SIZE(HDRP(bp)) - DSIZE)
 
-/*Given block ptr bp, compute address of next and previous blocks*/
+/* Address about prev, next free block */
+#define NXFRP(bp) ((char*)(bp) + DSIZE)
+#define PRFRP(bp) (char*)(bp)
+
+/* Given block ptr bp, compute address of next and previous blocks */
 #define NEXT_BLKP(bp) ((char*)(bp) + GET_SIZE(((char *)(bp) - WSIZE)))
 #define PREV_BLKP(bp) ((char*)(bp) - GET_SIZE(((char *)(bp) - DSIZE)))
+
+/* Approach to prev, next free block */
+#define NEXT_FBLKP(bp) *(char**)(NXFRP(bp))
+#define PREV_FBLKP(bp) *(char**)(PRFRP(bp))
+
 /******************************/
 
-// static int init_finish = 0;
+static char* fb_head_bp = NULL;
+static char* fb_tail_bp = NULL;
 static char* heap_listp;
+static int init_count = 0;
 
 /*
  * mm_init - initialize the malloc package.
  */
 int mm_init(void)
 {
-    
+    // printf("init\n");
+    init_count++;
+    mem_deinit();
+    mem_init();
     /* Create the initial empty heap */
     if ((heap_listp = (char*)mem_sbrk(4*WSIZE)) == (void *)-1)
     {
@@ -90,74 +105,131 @@ int mm_init(void)
     PUT(heap_listp + (3*WSIZE), PACK(0, 1)); //Epilogue header
     heap_listp += (2*WSIZE); //Payload position
 
+    fb_head_bp = NULL;
+    fb_tail_bp = NULL;
+
     if (extend_heap(CHUNKSIZE/WSIZE) == NULL)
     {
         return -1;
     }
-    // init_finish++;
-    //printf("--------------------\n");
-    //printf("init finish %d\n", init_finish);
     return 0;
 }
 
 void* extend_heap(size_t words)
 {
+    // printf("extend\n");
     char *bp;
     size_t size;
 
-    /*Allocate an even number of words to maintain alignment*/
-    size = (words % 2 == 0) ? words * WSIZE : (words + 1) * WSIZE;
+    size = words * WSIZE;
     if ((long)(bp = (char*)mem_sbrk(size)) == -1)
     {
         return NULL;
     }
 
     /* Initialize free block header/footer and the epilogue header */
-    PUT(HDRP(bp), PACK(size, 0));  //Free block header
+    PUT(HDRP(bp), PACK(size, 0)); // Free block header
     PUT(FTRP(bp), PACK(size, 0)); // Free block footer
-    //printf("extended size: %d\n", GET_SIZE(FTRP(bp)));
     PUT(HDRP(NEXT_BLKP(bp)), PACK(0, 1));  //New epilogue header
 
+    /* If free is not prev block */
     /* Coalesce if the previous block was free */
     return coalesce(bp);
 }
 
 void* coalesce(void* bp)
 {
-    //printf("now bp: %p\n", bp);
-    size_t prev_alloc = GET_ALLOC(FTRP(PREV_BLKP(bp)));
+    // printf("coalesce\n");
+    size_t prev_alloc = GET_ALLOC(HDRP(PREV_BLKP(bp)));
     size_t next_alloc = GET_ALLOC(HDRP(NEXT_BLKP(bp)));
     size_t size = GET_SIZE(HDRP(bp));
 
     if (prev_alloc && next_alloc) // Case 1
     {
-        //printf("case 1\n");
-        return bp;
+        // printf("coalesce case 1\n");
     }
     else if (prev_alloc && !next_alloc) // Case 2
     {
-        //printf("case 2\n");
+        // printf("coalesce case 2\n");
+        //Free Block pointer
+        remove_connection(NEXT_BLKP(bp));
+        //Block pointer
         size += GET_SIZE(HDRP(NEXT_BLKP(bp)));
         PUT(HDRP(bp), PACK(size, 0));
         PUT(FTRP(bp), PACK(size, 0));
     }
     else if (!prev_alloc && next_alloc) // Case 3
     {
-        //printf("case 3\n");
+        // printf("coalesce case 3\n");
+        //Free Block pointer
+        remove_connection(PREV_BLKP(bp));
+        //Block pointer
         size += GET_SIZE(HDRP(PREV_BLKP(bp)));
-        PUT(FTRP(bp), PACK(size, 0));
         PUT(HDRP(PREV_BLKP(bp)), PACK(size, 0));
+        PUT(FTRP(PREV_BLKP(bp)), PACK(size, 0));
         bp = PREV_BLKP(bp);
     }
     else // Case 4
     {
-        //printf("case 4\n");
-        size += GET_SIZE(HDRP(PREV_BLKP(bp))) + GET_SIZE(FTRP(NEXT_BLKP(bp)));
+        // printf("coalesce case 4\n");
+        //Free Block pointer
+        remove_connection(PREV_BLKP(bp));
+        remove_connection(NEXT_BLKP(bp));
+        //Block pointer
+        size += GET_SIZE(HDRP(PREV_BLKP(bp))) + GET_SIZE(HDRP(NEXT_BLKP(bp)));
         PUT(HDRP(PREV_BLKP(bp)), PACK(size, 0));
-        PUT(FTRP(NEXT_BLKP(bp)), PACK(size, 0));
+        PUT(FTRP(PREV_BLKP(bp)), PACK(size, 0));
         bp = PREV_BLKP(bp);
     }
+
+    //Free block management
+    add_to_free_list(bp);
+    // printf("bp position: %p\n", HDRP(bp));
+    // printf("coalesce end\n");
     return bp;
+}
+
+void remove_connection(void* bp)
+{
+    // printf("remove connection\n");
+    if (fb_head_bp == bp && fb_tail_bp == bp) //case 1
+    {
+        fb_head_bp = NULL;
+        fb_tail_bp = NULL;
+    }
+    else if (fb_head_bp == bp && fb_tail_bp != bp)
+    {
+        fb_head_bp = NEXT_FBLKP(bp);
+        PREV_FBLKP(NEXT_FBLKP(bp)) = NULL;
+    }
+    else if (fb_head_bp != bp && fb_tail_bp == bp)
+    {
+        fb_tail_bp = PREV_FBLKP(bp);
+        NEXT_FBLKP(PREV_FBLKP(bp)) = NULL;
+    }
+    else
+    {
+        PREV_FBLKP(NEXT_FBLKP(bp)) = PREV_FBLKP(bp);
+        NEXT_FBLKP(PREV_FBLKP(bp)) = NEXT_FBLKP(bp);
+    }
+    // printf("remove end\n");
+}
+
+void add_to_free_list(void* bp)
+{
+    PREV_FBLKP(bp) = NULL;
+    if (fb_head_bp != NULL)
+    {
+        NEXT_FBLKP(bp) = fb_head_bp;
+        PREV_FBLKP(fb_head_bp) = bp;
+        fb_head_bp = bp;
+    }
+    else
+    {
+        NEXT_FBLKP(bp) = NULL;
+        fb_head_bp = bp;
+        fb_tail_bp = bp;
+    }
 }
 
 /*
@@ -169,8 +241,7 @@ void *mm_malloc(size_t size)
     int newsize;
     size_t extendsize;
     char *bp;
-    //printf("-----------");
-    //printf("malloc size: %d\n", size);
+    // printf("malloc size: %d ", size);
 
     /* Ignore spurious requests */
     if (size == 0)
@@ -179,22 +250,30 @@ void *mm_malloc(size_t size)
     }
 
     /* Adjust block size to include overhead and alignment reqs */
-    if (size <= DSIZE)
+    if (size <= 3*DSIZE)
     {
-        newsize = 2*DSIZE;
+        newsize = 4*DSIZE;
     }
     else
     {
-        newsize = DSIZE * ((size + (DSIZE) + (DSIZE - 1)) /  DSIZE);
+        newsize = (4 * DSIZE) * ((size + (4 * DSIZE)) /  (4 * DSIZE)) + (4 * DSIZE);
     }
-    
+
+    // printf("-----malloc----\n");
+    // printf("new size: %d\n", newsize);
+    // printf("init count: %d\n", init_count);
+    // if (init_count >= 49)
+    // {
+    //     print_all_list();
+    //     print_free_list();
+    // }
+
     /* Search the free list for a fit */
     if ((bp = (char*)find_fit(newsize)) != NULL) {
         place(bp, newsize);
         return bp;
     }
 
-    //printf("no fit found\n");
     /* No fit found. Get more memory and place the block */
     extendsize = MAX(newsize, CHUNKSIZE);
     if ((bp = (char*)extend_heap(extendsize/WSIZE)) == NULL)
@@ -207,31 +286,20 @@ void *mm_malloc(size_t size)
 
 void* find_fit(size_t newsize)
 {
-    //initiate bp to epilogue bp
-    char* now_bp = heap_listp;
-
-    //printf("----------\n");
-    //printf("new size %d\n", newsize);
-
-    //if the header does not meet condition, update it
-    while((GET_SIZE(HDRP(now_bp)) < newsize) || (GET_ALLOC(HDRP(now_bp)) == 1))
+    // printf("find fit\n");
+    //initiate bp to free block list head bp
+    char* now_bp = fb_head_bp;
+    if (now_bp == NULL)
     {
-        //printf("now size %d ", GET_SIZE(HDRP(now_bp)));
-        //printf("now allocated %d ||", GET_ALLOC(HDRP(now_bp)));
-        //if next head is epilogue == return
-        if (GET_SIZE(HDRP(now_bp)) == 0)
-        {
-            return NULL;
-        }
-        now_bp = NEXT_BLKP(now_bp);
+        return NULL;
     }
-    //printf("now size %d ", GET_SIZE(HDRP(now_bp)));
-    //printf("now allocated %d ||", GET_ALLOC(HDRP(now_bp)));
-    //printf("next size %d ", GET_SIZE(HDRP(NEXT_BLKP(now_bp))));
-    //printf("next allocated %d ||", GET_ALLOC(HDRP(NEXT_BLKP(now_bp))));
-    //printf("\n");
 
-    if (GET_SIZE(HDRP(now_bp)) >= newsize && GET_ALLOC(HDRP(now_bp)) == 0)
+    while (NEXT_FBLKP(now_bp) != NULL && GET_SIZE(HDRP(now_bp)) < newsize)
+    {
+        now_bp = NEXT_FBLKP(now_bp);
+    }
+
+    if (GET_SIZE(HDRP(now_bp)) >= newsize)
     {
         return now_bp;
     }
@@ -243,16 +311,23 @@ void* find_fit(size_t newsize)
 
 void place(void* bp, size_t newsize)
 {
-    //printf("placed\n");
+    // printf("place\n");
     size_t before_place_size = GET_SIZE(HDRP(bp));
     //Allocated Header & Footer
     PUT(HDRP(bp), PACK(newsize, 1));
     PUT(FTRP(bp), PACK(newsize, 1));
     //Make Next Block Header & Footer
+    remove_connection(bp);
+
+    //Change free block point of next block
     if (before_place_size > newsize)
     {
-        PUT(HDRP(NEXT_BLKP(bp)), PACK(before_place_size-newsize, 0));
-        PUT(FTRP(NEXT_BLKP(bp)), PACK(before_place_size-newsize, 0));
+        PUT(HDRP(NEXT_BLKP(bp)), PACK(before_place_size - newsize, 0));
+        PUT(FTRP(NEXT_BLKP(bp)), PACK(before_place_size - newsize, 0));
+
+        //Free block management
+        char* newBp = NEXT_BLKP(bp);
+        add_to_free_list(newBp);
     }
 }
 
@@ -261,9 +336,9 @@ void place(void* bp, size_t newsize)
  */
 void mm_free(void *bp)
 {
-    //printf("freeeeeee\n");
+    // printf("---------------freee-----------------\n");
+    // print_free_list();
     size_t size = GET_SIZE(HDRP(bp));
-    //printf("size: %d\n", size);
     PUT(HDRP(bp), PACK(size, 0));
     PUT(FTRP(bp), PACK(size, 0));
     coalesce(bp);
@@ -274,6 +349,7 @@ void mm_free(void *bp)
  */
 void *mm_realloc(void *ptr, size_t size)
 {
+    // printf("realloc\n");
     void *oldptr = ptr;
     void *newptr;
     size_t copySize;
@@ -287,4 +363,53 @@ void *mm_realloc(void *ptr, size_t size)
     memcpy(newptr, oldptr, copySize);
     mm_free(oldptr);
     return newptr;
+}
+
+void print_free_list() {
+    char* now_bp = fb_head_bp;
+
+    printf("-----print free-----\n");
+
+    if (fb_head_bp == NULL) {
+        printf("No list here\n");
+    }
+    printf("head: %p\n", HDRP(fb_head_bp));
+    printf("tail: %p\n", HDRP(fb_tail_bp));
+    while (now_bp != NULL) 
+    {
+        printf("prev bp position: %p ", HDRP(PREV_FBLKP(now_bp)));
+        printf("now header: %p ", HDRP(now_bp));
+        printf("now alloc: %d ", GET_ALLOC(HDRP(now_bp)));
+        printf("now bp size: %d ", GET_SIZE(HDRP(now_bp)));
+        printf("next bp position: %p ||", HDRP(NEXT_FBLKP(now_bp)));
+
+        now_bp = NEXT_FBLKP(now_bp);
+    }
+    printf("\n");
+}
+
+void print_all_list() {
+        //initiate bp to epilogue bp
+        char* now_bp = heap_listp;
+
+        printf("------print all------\n");
+    
+        //if the header does not meet condition, update it
+        while(GET_SIZE(HDRP(now_bp)) != 0)
+        {
+            printf("now header %p ", HDRP(now_bp));
+            printf("now size %d ", GET_SIZE(HDRP(now_bp)));
+            printf("now allocated %d ||", GET_ALLOC(HDRP(now_bp)));
+            // printf("now footer %p ", FTRP(now_bp));
+            // printf("now size %d ", GET_SIZE(FTRP(now_bp)));
+            // printf("now allocated %d ", GET_ALLOC(FTRP(now_bp)));
+            // printf("prev bp: %p ", PREV_BLKP(now_bp));
+            // printf("next bp: %p ||", NEXT_BLKP(now_bp));
+            now_bp = NEXT_BLKP(now_bp);
+        }
+        printf("now header %p ", HDRP(now_bp));
+        printf("now size %d ", GET_SIZE(HDRP(now_bp)));
+        printf("now allocated %d ||", GET_ALLOC(HDRP(now_bp)));
+        printf("next size %d ", GET_SIZE(HDRP(NEXT_BLKP(now_bp))));
+        printf("next allocated %d ||\n", GET_ALLOC(HDRP(NEXT_BLKP(now_bp))));
 }

@@ -7,9 +7,14 @@ extern void* coalesce (void* bp);
 extern void *mm_malloc (size_t size);
 extern void* find_fit(size_t newsize);
 extern void place(void* bp, size_t newsize);
+extern void remove_connection(void* bp);
+extern void add_to_free_list(void* bp);
 
 extern void mm_free (void *ptr);
 extern void *mm_realloc(void *ptr, size_t size);
+
+extern void print_all_list();
+extern void print_free_list();
 
 
 /* 
